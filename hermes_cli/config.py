@@ -904,6 +904,7 @@ def _ensure_hermes_home_managed(home: Path):
 # =============================================================================
 
 DEFAULT_CONFIG = {
+    "headroom": {"enabled": False, "mode": "off", "telemetry_enabled": False, "fail_open": True, "minimum_input_tokens": 4000, "minimum_expected_savings_percent": 10, "timeout_ms": 5000, "preserve_original_hash": True, "record_metrics": True, "raw_content_logging": False},
     "model": "",
     "providers": {},
     "fallback_providers": [],

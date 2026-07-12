@@ -1166,6 +1166,7 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
+                _headroom_result = None
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -1185,6 +1186,15 @@ def run_conversation(
                     api_kwargs = _llm_request_mw.payload
                     _original_api_kwargs = _llm_request_mw.original_payload
                     _llm_middleware_trace = _llm_request_mw.trace
+                    from hermes_cli.headroom_adapter import apply_to_request
+                    api_kwargs, _headroom_result = apply_to_request(
+                    api_kwargs,
+                    {"headroom": getattr(agent, "headroom_config", {})},
+                    request_id=api_request_id,
+                    task_id=effective_task_id,
+                    provider=agent.provider,
+                    model=agent.model,
+                    )
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
@@ -1304,11 +1314,33 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                    from hermes_cli.headroom_adapter import complete_metrics
+                    try:
+                        if _use_streaming:
+                            response = agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        else:
+                            response = agent._interruptible_api_call(next_api_kwargs)
+                    except BaseException:
+                        if _headroom_result is not None:
+                            complete_metrics(
+                                _headroom_result,
+                                request_succeeded=False,
+                                retry_used_original_context=bool(
+                                    retry_count > 0 and _headroom_result.original_context_used
+                                ),
+                            )
+                        raise
+                    if _headroom_result is not None:
+                        complete_metrics(
+                            _headroom_result,
+                            request_succeeded=True,
+                            retry_used_original_context=bool(
+                                retry_count > 0 and _headroom_result.original_context_used
+                            ),
                         )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    return response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 

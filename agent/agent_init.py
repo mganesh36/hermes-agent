@@ -1216,6 +1216,7 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+        agent.headroom_config = dict(_agent_cfg.get("headroom") or {})
     try:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(

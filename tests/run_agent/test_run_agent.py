@@ -7607,3 +7607,105 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+
+
+def _configure_synthetic_headroom_lifecycle_agent(agent):
+    agent._cached_system_prompt = "synthetic system prompt"
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.headroom_config = {
+        "enabled": True,
+        "mode": "observe",
+        "minimum_input_tokens": 0,
+        "telemetry_enabled": False,
+        "raw_content_logging": False,
+    }
+
+
+def test_headroom_metrics_completed_after_mocked_transport_success(agent, monkeypatch):
+    import hermes_cli.headroom_adapter as headroom_adapter
+
+    _configure_synthetic_headroom_lifecycle_agent(agent)
+    provider_state = (agent.provider, agent.model, tuple(getattr(agent, "fallback_providers", None) or ()))
+    completed = []
+    real_complete = headroom_adapter.complete_metrics
+
+    def capture(result, **kwargs):
+        event = real_complete(result, **kwargs)
+        completed.append(dict(event))
+        return event
+
+    monkeypatch.setattr(headroom_adapter, "complete_metrics", capture)
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda _kwargs: _mock_response(content="synthetic success", finish_reason="stop"),
+    )
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("synthetic lifecycle prompt")
+
+    assert result["completed"] is True
+    assert completed and completed[-1]["request_succeeded"] is True
+    assert "synthetic lifecycle prompt" not in json.dumps(completed, sort_keys=True)
+    assert (agent.provider, agent.model, tuple(getattr(agent, "fallback_providers", None) or ())) == provider_state
+
+
+def test_headroom_metrics_completed_before_mocked_transport_failure(agent, monkeypatch):
+    import hermes_cli.headroom_adapter as headroom_adapter
+
+    _configure_synthetic_headroom_lifecycle_agent(agent)
+    completed = []
+    real_complete = headroom_adapter.complete_metrics
+
+    def capture(result, **kwargs):
+        event = real_complete(result, **kwargs)
+        completed.append(dict(event))
+        return event
+
+    def interrupt(_kwargs):
+        raise KeyboardInterrupt("synthetic provider interruption")
+
+    monkeypatch.setattr(headroom_adapter, "complete_metrics", capture)
+    monkeypatch.setattr(agent, "_interruptible_api_call", interrupt)
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        pytest.raises(KeyboardInterrupt, match="synthetic provider interruption"),
+    ):
+        agent.run_conversation("synthetic failure prompt")
+
+    assert completed and completed[-1]["request_succeeded"] is False
+    assert "synthetic failure prompt" not in json.dumps(completed, sort_keys=True)
+
+
+def test_headroom_retry_original_context_completion_preserves_routing(agent, monkeypatch):
+    import hermes_cli.headroom_adapter as headroom_adapter
+
+    _configure_synthetic_headroom_lifecycle_agent(agent)
+    provider_state = (agent.provider, agent.model, tuple(getattr(agent, "fallback_providers", None) or ()))
+    original = {
+        "synthetic": True,
+        "model": "synthetic-model",
+        "messages": [{"synthetic": True, "role": "tool", "content": "synthetic tool output"}],
+    }
+    policy = headroom_adapter.policy_from_mapping(
+        {"enabled": True, "mode": "observe", "minimum_input_tokens": 0}
+    )
+    optimization = headroom_adapter.optimize_context(original, policy, compressor=lambda t, _: t[:8])
+    event = headroom_adapter.complete_metrics(
+        optimization,
+        request_succeeded=True,
+        retry_used_original_context=True,
+    )
+    assert optimization.original_context_used is True
+    assert event["retry_used_original_context"] is True
+    assert "synthetic tool output" not in json.dumps(event, sort_keys=True)
+    assert (agent.provider, agent.model, tuple(getattr(agent, "fallback_providers", None) or ())) == provider_state
