@@ -40,7 +40,9 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import stat
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -95,6 +97,10 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+HEALTH_READ_CREDENTIAL_NAME = "atlas-health-read-token"
+HEALTH_READ_CREDENTIAL_FILE_ENV = "API_SERVER_HEALTH_READ_CREDENTIAL_FILE"
+MAX_HEALTH_READ_TOKEN_BYTES = 4096
+MIN_HEALTH_READ_TOKEN_CHARS = 16
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -851,6 +857,13 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._health_read_credential_file: str = str(
+            extra.get(
+                "health_read_credential_file",
+                os.getenv(HEALTH_READ_CREDENTIAL_FILE_ENV, ""),
+            )
+            or ""
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1071,6 +1084,108 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    def _health_read_credential_path(self) -> Optional[Path]:
+        """Resolve the dedicated health-read credential file path, if configured."""
+        if self._health_read_credential_file:
+            return Path(self._health_read_credential_file)
+
+        credentials_dir = os.getenv("CREDENTIALS_DIRECTORY", "")
+        if not credentials_dir:
+            return None
+        return Path(credentials_dir) / HEALTH_READ_CREDENTIAL_NAME
+
+    def _read_health_read_token(self) -> Optional[str]:
+        """Read the dedicated health-read token from a bounded regular file.
+
+        Fail closed on missing/unreadable/malformed files. Never logs or returns
+        the credential value.
+        """
+        path = self._health_read_credential_path()
+        if path is None:
+            return None
+
+        open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            return None
+        open_flags |= nofollow
+
+        fd: Optional[int] = None
+        try:
+            fd = os.open(path, open_flags)
+            stat_result = os.fstat(fd)
+            if not stat.S_ISREG(stat_result.st_mode):
+                return None
+            if stat_result.st_size <= 0 or stat_result.st_size > MAX_HEALTH_READ_TOKEN_BYTES:
+                return None
+            raw = os.read(fd, MAX_HEALTH_READ_TOKEN_BYTES + 1)
+        except OSError:
+            return None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        if not raw or len(raw) > MAX_HEALTH_READ_TOKEN_BYTES:
+            return None
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+            if raw.endswith(b"\r"):
+                raw = raw[:-1]
+        try:
+            token = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if len(token) < MIN_HEALTH_READ_TOKEN_CHARS or len(token) > MAX_HEALTH_READ_TOKEN_BYTES:
+            return None
+        if any(ch.isspace() or unicodedata.category(ch).startswith("C") for ch in token):
+            return None
+        return token
+
+    def _check_health_read_auth(self, request: "web.Request") -> Optional["web.Response"]:
+        """Validate route-scoped health-read bearer auth for GET /health/detailed only."""
+        if request.method != "GET" or request.path != "/health/detailed":
+            return web.json_response(
+                {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            )
+
+        token = self._read_health_read_token()
+        if not token:
+            return web.json_response(
+                {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            )
+
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            supplied = auth_header[len("Bearer "):]
+            if (
+                supplied
+                and len(supplied) <= MAX_HEALTH_READ_TOKEN_BYTES
+                and not any(ch.isspace() or unicodedata.category(ch).startswith("C") for ch in supplied)
+                and hmac.compare_digest(supplied, token)
+            ):
+                return None
+
+        return web.json_response(
+            {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+            status=401,
+        )
+
+    def _check_health_detailed_auth(self, request: "web.Request") -> Optional["web.Response"]:
+        """Allow /health/detailed via global API auth or route-scoped health auth."""
+        global_auth = self._check_auth(request)
+        if self._api_key and global_auth is None:
+            return None
+
+        health_auth = self._check_health_read_auth(request)
+        if health_auth is None:
+            return None
+        return global_auth or health_auth
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -1380,7 +1495,7 @@ class APIServerAdapter(BasePlatformAdapter):
         dashboard can display full status without needing a shared PID file or
         /proc access.  Requires the same Bearer auth as other API routes.
         """
-        auth_err = self._check_auth(request)
+        auth_err = self._check_health_detailed_auth(request)
         if auth_err:
             return auth_err
 
