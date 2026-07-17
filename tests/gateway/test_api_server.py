@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import inspect
 import json
 import os
 import stat
@@ -27,6 +28,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    HEALTH_READ_CREDENTIAL_NAME,
+    MAX_HEALTH_READ_TOKEN_BYTES,
+    MIN_HEALTH_READ_TOKEN_CHARS,
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
@@ -589,11 +593,13 @@ class TestConcurrencyCap:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
+def _make_adapter(api_key: str = "", cors_origins=None, health_read_credential_file: str = "") -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
     if api_key:
         extra["key"] = api_key
+    if health_read_credential_file:
+        extra["health_read_credential_file"] = health_read_credential_file
     if cors_origins is not None:
         extra["cors_origins"] = cors_origins
     config = PlatformConfig(enabled=True, extra=extra)
@@ -729,8 +735,9 @@ class TestHealthEndpoint:
 
 class TestHealthDetailedEndpoint:
     @pytest.mark.asyncio
-    async def test_health_detailed_returns_ok(self, adapter):
+    async def test_health_detailed_returns_ok(self):
         """GET /health/detailed returns status, platform, and runtime fields."""
+        adapter = _make_adapter(api_key="global-api-key-123456")
         app = _create_app(adapter)
         with patch("gateway.status.read_runtime_status", return_value={
             "gateway_state": "running",
@@ -740,7 +747,7 @@ class TestHealthDetailedEndpoint:
             "updated_at": "2026-04-14T00:00:00Z",
         }):
             async with TestClient(TestServer(app)) as cli:
-                resp = await cli.get("/health/detailed")
+                resp = await cli.get("/health/detailed", headers={"Authorization": "Bearer global-api-key-123456"})
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["status"] == "ok"
@@ -756,12 +763,13 @@ class TestHealthDetailedEndpoint:
                 assert "updated_at" in data
 
     @pytest.mark.asyncio
-    async def test_health_detailed_no_runtime_status(self, adapter):
+    async def test_health_detailed_no_runtime_status(self):
         """When gateway_state.json is missing, fields are None."""
+        adapter = _make_adapter(api_key="global-api-key-123456")
         app = _create_app(adapter)
         with patch("gateway.status.read_runtime_status", return_value=None):
             async with TestClient(TestServer(app)) as cli:
-                resp = await cli.get("/health/detailed")
+                resp = await cli.get("/health/detailed", headers={"Authorization": "Bearer global-api-key-123456"})
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["status"] == "ok"
@@ -788,6 +796,316 @@ class TestHealthDetailedEndpoint:
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed", headers=headers)
                 assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_allows_route_scoped_health_token(self, tmp_path):
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_text("synthetic-health-token-123456\n")
+        adapter = _make_adapter(
+            api_key="sk-global-secret",
+            health_read_credential_file=str(token_path),
+        )
+        app = _create_app(adapter)
+        headers = {"Authorization": "Bearer synthetic-health-token-123456"}
+        with patch("gateway.status.read_runtime_status", return_value={"gateway_state": "running"}):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed", headers=headers)
+                assert resp.status == 200
+                assert "synthetic-health-token-123456" not in await resp.text()
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_rejects_invalid_health_token(self, tmp_path):
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_text("synthetic-health-token-123456\n")
+        adapter = _make_adapter(
+            api_key="***",
+            health_read_credential_file=str(token_path),
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/health/detailed",
+                headers={"Authorization": "Bearer wrong-health-token-123456"},
+            )
+            body = await resp.text()
+            assert resp.status == 401
+            assert "synthetic-health-token-123456" not in body
+            assert "wrong-health-token-123456" not in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "authorization",
+        [
+            "Bearer",
+            "Bearer ",
+            "Bearer  synthetic-health-token-123456",
+            "Bearer\tsynthetic-health-token-123456",
+            "Bearer synthetic-health-token-123456 ",
+            "Bearer synthetic-health-token-123456\t",
+            "Bearer synthetic-health-token-123456 extra",
+            "bearer synthetic-health-token-123456",
+            "Basic synthetic-health-token-123456",
+            "Token synthetic-health-token-123456",
+            "Bearer synthetic-health-token-123456, Bearer synthetic-health-token-123456",
+            "Bearer synthetic-health-token-123456" + "x" * MAX_HEALTH_READ_TOKEN_BYTES,
+        ],
+    )
+    async def test_health_detailed_rejects_malformed_authorization_header(self, tmp_path, authorization):
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_text("synthetic-health-token-123456\n")
+        adapter = _make_adapter(
+            api_key="***",
+            health_read_credential_file=str(token_path),
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/health/detailed", headers={"Authorization": authorization})
+            body = await resp.text()
+            assert resp.status == 401
+            assert "synthetic-health-token-123456" not in body
+            assert authorization not in body
+
+    def test_health_read_auth_rejects_malformed_authorization_values(self, tmp_path):
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_text("synthetic-health-token-123456\n")
+        adapter = _make_adapter(
+            api_key="***",
+            health_read_credential_file=str(token_path),
+        )
+        malformed_values = [
+            "Bearer",
+            "Bearer ",
+            "Bearer  synthetic-health-token-123456",
+            "Bearer\tsynthetic-health-token-123456",
+            "Bearer synthetic-health-token-123456 ",
+            "Bearer synthetic-health-token-123456\t",
+            "Bearer synthetic-health-token-123456 extra",
+            "bearer synthetic-health-token-123456",
+            "Basic synthetic-health-token-123456",
+            "Token synthetic-health-token-123456",
+            "Bearer synthetic-health-token-123456\r",
+            "Bearer synthetic-health-token-123456\n",
+            "Bearer synthetic-health-token-123456\v",
+            "Bearer synthetic-health-token-123456\f",
+            "Bearer synthetic-health-token-123456\u2003",
+            "Bearer synthetic-health-token-123456, Bearer synthetic-health-token-123456",
+            "Bearer synthetic-health-token-123456" + "x" * MAX_HEALTH_READ_TOKEN_BYTES,
+        ]
+        for authorization in malformed_values:
+            request = MagicMock()
+            request.method = "GET"
+            request.path = "/health/detailed"
+            request.headers = {"Authorization": authorization}
+            assert adapter._check_health_read_auth(request) is not None
+
+    def test_health_read_auth_parser_has_no_supplied_strip_family_calls(self):
+        source = inspect.getsource(APIServerAdapter._check_health_read_auth)
+        supplied_lines = "\n".join(line for line in source.splitlines() if "supplied" in line)
+        assert ".strip(" not in supplied_lines
+        assert ".lstrip(" not in supplied_lines
+        assert ".rstrip(" not in supplied_lines
+        assert "hmac.compare_digest(supplied, token)" in source
+
+
+    @pytest.mark.asyncio
+    async def test_missing_health_token_preserves_existing_global_auth_behavior(self, tmp_path):
+        adapter = _make_adapter(
+            api_key="sk-global-secret",
+            health_read_credential_file=str(tmp_path / "missing-token"),
+        )
+        app = _create_app(adapter)
+        with patch("gateway.status.read_runtime_status", return_value={"gateway_state": "running"}):
+            async with TestClient(TestServer(app)) as cli:
+                missing = await cli.get("/health/detailed")
+                authed = await cli.get(
+                    "/health/detailed",
+                    headers={"Authorization": "Bearer sk-global-secret"},
+                )
+                assert missing.status == 401
+                assert authed.status == 200
+
+    @pytest.mark.asyncio
+    async def test_health_token_cannot_access_other_routes_or_methods(self, tmp_path):
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_text("synthetic-health-token-123456\n")
+        adapter = _make_adapter(
+            api_key="sk-global-secret",
+            health_read_credential_file=str(token_path),
+        )
+        app = _create_app(adapter)
+        headers = {"Authorization": "Bearer synthetic-health-token-123456"}
+        async with TestClient(TestServer(app)) as cli:
+            attempts = [
+                await cli.get("/v1/models", headers=headers),
+                await cli.get("/v1/capabilities", headers=headers),
+                await cli.get("/v1/skills", headers=headers),
+                await cli.get("/v1/toolsets", headers=headers),
+                await cli.post("/v1/chat/completions", headers=headers, json={}),
+                await cli.post("/v1/responses", headers=headers, json={}),
+                await cli.get("/v1/responses/abc", headers=headers),
+                await cli.delete("/v1/responses/abc", headers=headers),
+                await cli.post("/health/detailed", headers=headers),
+                await cli.get("/health/detailed/extra", headers=headers),
+                await cli.get("/health/detailedness", headers=headers),
+                await cli.get("/unknown", headers=headers),
+            ]
+            assert all(resp.status in {401, 403, 404, 405} for resp in attempts)
+            assert all(resp.status != 200 for resp in attempts)
+            for resp in attempts:
+                assert "synthetic-health-token-123456" not in await resp.text()
+
+    def test_health_read_auth_rejects_non_get_and_non_exact_route(self, tmp_path):
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_text("synthetic-health-token-123456\n")
+        adapter = _make_adapter(
+            api_key="sk-global-secret",
+            health_read_credential_file=str(token_path),
+        )
+        for method, path in [
+            ("POST", "/health/detailed"),
+            ("GET", "/health/detailed/extra"),
+            ("GET", "/health/detailedness"),
+            ("GET", "/v1/runs"),
+            ("POST", "/api/jobs"),
+        ]:
+            request = MagicMock()
+            request.method = method
+            request.path = path
+            request.headers = {"Authorization": "Bearer synthetic-health-token-123456"}
+            assert adapter._check_health_read_auth(request) is not None
+
+    def test_health_read_credential_file_rejects_malformed_sources(self, tmp_path, monkeypatch):
+        valid = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        valid.write_text("synthetic-health-token-123456\n")
+        adapter = _make_adapter(health_read_credential_file=str(valid))
+        assert adapter._read_health_read_token() == "synthetic-health-token-123456"
+
+        empty = tmp_path / "empty"
+        empty.write_text("")
+        assert _make_adapter(health_read_credential_file=str(empty))._read_health_read_token() is None
+
+        malformed = tmp_path / "malformed"
+        malformed.write_text("synthetic token with spaces")
+        assert _make_adapter(health_read_credential_file=str(malformed))._read_health_read_token() is None
+
+        oversized = tmp_path / "oversized"
+        oversized.write_text("x" * (MAX_HEALTH_READ_TOKEN_BYTES + 1))
+        assert _make_adapter(health_read_credential_file=str(oversized))._read_health_read_token() is None
+
+        target = tmp_path / "target"
+        target.write_text("synthetic-health-token-123456")
+        link = tmp_path / "link"
+        link.symlink_to(target)
+        assert _make_adapter(health_read_credential_file=str(link))._read_health_read_token() is None
+
+        credentials_dir = tmp_path / "credentials"
+        credentials_dir.mkdir()
+        (credentials_dir / HEALTH_READ_CREDENTIAL_NAME).write_text("synthetic-health-token-abcdef")
+        monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials_dir))
+        assert _make_adapter()._read_health_read_token() == "synthetic-health-token-abcdef"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("api_key", "credential_body", "authorization", "expected_status"),
+        [
+            (None, None, None, 401),
+            (None, "synthetic-health-token-123456", "Bearer synthetic-health-token-123456", 200),
+            (None, "synthetic-health-token-123456", "Bearer wrong-health-token-123456", 401),
+            ("global-api-key-123456", None, "Bearer global-api-key-123456", 200),
+            ("global-api-key-123456", "synthetic-health-token-123456", "Bearer synthetic-health-token-123456", 200),
+            ("global-api-key-123456", "synthetic-health-token-123456", "Bearer global-api-key-123456", 200),
+            ("global-api-key-123456", "synthetic-health-token-123456", "Bearer wrong-token-123456", 401),
+            ("global-api-key-123456", "synthetic-health-token-123456", None, 401),
+        ],
+    )
+    async def test_health_detailed_auth_configuration_matrix(
+        self, tmp_path, api_key, credential_body, authorization, expected_status
+    ):
+        credential_file = None
+        if credential_body is not None:
+            credential_file = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+            credential_file.write_text(credential_body)
+        adapter = _make_adapter(
+            api_key=api_key,
+            health_read_credential_file=str(credential_file) if credential_file else None,
+        )
+        app = _create_app(adapter)
+        headers = {"Authorization": authorization} if authorization is not None else None
+        with patch("gateway.status.read_runtime_status", return_value={"gateway_state": "running"}):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed", headers=headers)
+                assert resp.status == expected_status
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            ("synthetic-health-token-123456", "synthetic-health-token-123456"),
+            ("synthetic-health-token-123456\n", "synthetic-health-token-123456"),
+            ("synthetic-health-token-123456\r\n", "synthetic-health-token-123456"),
+            ("synthetic-health-token-123456\n\n", None),
+            ("synthetic-health-token-123456\r\n\r\n", None),
+            ("synthetic-health-token-123456\u2003", None),
+            ("synthetic-health-token-123456\u200b", None),
+            ("synthetic-health-token-123456\x1f", None),
+            ("synthetic-health-token-123456\x7f", None),
+            ("é" * MIN_HEALTH_READ_TOKEN_CHARS, "é" * MIN_HEALTH_READ_TOKEN_CHARS),
+            ("a" * MIN_HEALTH_READ_TOKEN_CHARS, "a" * MIN_HEALTH_READ_TOKEN_CHARS),
+            ("a" * MAX_HEALTH_READ_TOKEN_BYTES, "a" * MAX_HEALTH_READ_TOKEN_BYTES),
+        ],
+    )
+    def test_health_read_credential_character_grammar(self, tmp_path, body, expected):
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_text(body)
+        assert _make_adapter(health_read_credential_file=str(token_path))._read_health_read_token() == expected
+
+    def test_health_read_credential_rejects_malformed_utf8(self, tmp_path):
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_bytes(b"\xff" * MIN_HEALTH_READ_TOKEN_CHARS)
+        assert _make_adapter(health_read_credential_file=str(token_path))._read_health_read_token() is None
+
+    def test_health_read_credential_rejects_non_regular_files_and_growth(self, tmp_path):
+        directory = tmp_path / "directory"
+        directory.mkdir()
+        assert _make_adapter(health_read_credential_file=str(directory))._read_health_read_token() is None
+
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+        with patch("gateway.platforms.api_server.os.open", side_effect=OSError):
+            assert _make_adapter(health_read_credential_file=str(fifo))._read_health_read_token() is None
+
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_text("synthetic-health-token-123456")
+        with patch("gateway.platforms.api_server.os.read", return_value=b"x" * (MAX_HEALTH_READ_TOKEN_BYTES + 1)):
+            assert _make_adapter(health_read_credential_file=str(token_path))._read_health_read_token() is None
+
+    def test_health_read_credential_reads_opened_descriptor_despite_path_replacement(self, tmp_path):
+        token_path = tmp_path / HEALTH_READ_CREDENTIAL_NAME
+        token_path.write_text("synthetic-health-token-123456")
+        replacement = tmp_path / "replacement"
+        replacement.write_text("replacement-health-token-123456")
+        real_open = os.open
+
+        def replacing_open(path, flags):
+            fd = real_open(path, flags)
+            os.replace(replacement, token_path)
+            return fd
+
+        with patch("gateway.platforms.api_server.os.open", side_effect=replacing_open):
+            assert (
+                _make_adapter(health_read_credential_file=str(token_path))._read_health_read_token()
+                == "synthetic-health-token-123456"
+            )
+
+    def test_health_read_auth_uses_constant_time_compare(self):
+        with patch("gateway.platforms.api_server.hmac.compare_digest", return_value=True) as compare:
+            adapter = _make_adapter()
+            request = MagicMock()
+            request.method = "GET"
+            request.path = "/health/detailed"
+            request.headers = {"Authorization": "Bearer supplied-token-123456"}
+            with patch.object(adapter, "_read_health_read_token", return_value="stored-token-123456"):
+                assert adapter._check_health_read_auth(request) is None
+            compare.assert_called_once_with("supplied-token-123456", "stored-token-123456")
 
 
 # ---------------------------------------------------------------------------
